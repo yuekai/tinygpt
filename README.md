@@ -6,6 +6,18 @@ tinygpt trains a transfomer-based language model on the [TinyStories dataset](ht
 
 `gpt.py` is a utility file that specifies the parts of the model (the actual model configuration in terms of the parts is in `tinygpt.py`). 
 
-`tinygpt.py` is the main file that configures the model, implements the data loader, and trains the model. The model has 64M parameters, and we train it with a batch size of 500k tokens. It takes 20-30 mins to make a pass thru the dataset on a 2x 4090 node, achieving a validation loss of 1.7-ish. It supports training on multiple GPUs (on a single node) for now, but I may remove this functionality in the future after I shrink the model more so that training on a single GPU is practical.
+`tinygpt.py` is the main file that configures the model, implements the data loader, and trains the model. The model has 61M parameters, and we train it with batches of 500k tokens. It takes 25-30 mins to make a pass thru the dataset on a 2x 4090 node, so a 10 epoch training run takes 4-5 hrs (achieving a validation loss of 1.32). 
 
-`nb.ipynb` is a notebook that analyzes the training data and generates some completions. 
+1. The file supports training on multiple GPUs (on a single node) for now, but I may remove this functionality in the future after I shrink the model more so that training on a single GPU is practical.
+2. `torchinfo` summarizes the model as having 86M (trainable) parameters, but the weights of the final linear layer and the token embedding layer are shared, so the actual number of parameters is 61M. You can check this by checking `model.transformer.wte.weight = model.lm_head.weight`.
+3. training hyperparameters are those of [TinyStories-33M](https://huggingface.co/roneneldan/TinyStories-33M)
+
+`nb.ipynb` is a notebook that analyzes the training data and generates some text. Here is a sample:
+
+```
+<|endoftext|>Once upon a time, there was a chubby bunny named Bongo. Bongo loved to play all day long. One day, Bongo wanted to go outside and play, but it had a tug--ri ran out of exhaustion. Bongo didn't know what to do and he was so grumpy! 
+
+Bongo decided to ask his friend, a bear named Ben, for help. Ben was so happy to help Bongo, but Peppa told him it was too late. Bongo had won and his digging. Bongo was so happy that he tried to help his friend. 
+
+Together, they worked both around the meadow, and Bongo was so proud! After many days, Bongo and Ben became best friends. Bongo was so happy that he forgot all about the scary size of Jack's rattle. The moral of the story is that right friends can help you become a better team.<|endoftext|>Once there was a little girl called Kayla
+```

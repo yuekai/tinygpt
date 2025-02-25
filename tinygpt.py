@@ -53,7 +53,7 @@ class TinyStoriesDataLoader:
 ########
 # main #
 #######################################################
-# torchrun --standalone --nproc_per_node=4 tinygpt.py #
+# torchrun --standalone --nproc_per_node=2 tinygpt.py #
 #######################################################
 
 from dataclasses import dataclass
