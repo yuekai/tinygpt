@@ -1,6 +1,6 @@
 # tinygpt (all lowercase)
 
-tinygpt trains a transfomer-based language model on the [TinyStories dataset](https://huggingface.co/datasets/roneneldan/TinyStories). It is intended as a teaching resource, so most things are implemented from scratch with minimal abstractions.
+Pretrain a transfomer model on the [TinyStories dataset](https://huggingface.co/datasets/roneneldan/TinyStories). The architecture is similar to that of [GPT-2](https://huggingface.co/openai-community/gpt2). It is intended as a teaching resource, so most things are implemented from scratch with minimal abstractions.
 
 `tinystories.py` downloads the dataset, tokenizes it with Eleuther AI's GPT-Neo-125M tokenizer, and saves it in shards of 100M tokens per shard in the `tinystories` directory. There are 474M tokens in the TinyStories sdataset.
 
@@ -21,3 +21,9 @@ Bongo decided to ask his friend, a bear named Ben, for help. Ben was so happy to
 
 Together, they worked both around the meadow, and Bongo was so proud! After many days, Bongo and Ben became best friends. Bongo was so happy that he forgot all about the scary size of Jack's rattle. The moral of the story is that right friends can help you become a better team.<|endoftext|>Once there was a little girl called Kayla
 ```
+
+__ToDo:__
+- [x] Implement grouped query attention (GQA) to reduce model size.
+- [ ] Implement tokenizer from scratch (instead of relying on Eleuther AI's GPT-Neo-125M tokenizer).
+- [ ] Implement rotary position embeddings (instead of absolute position embeddings). This (together with GQA) brings the architecture (mostly) in line with the latest open weight LLMs.
+- [ ] Reduce the vocabulary from 50k-ish to 5k-ish. I suspect we can get away with a smaller vocabulary because the language in TinyStores is so simple. 
