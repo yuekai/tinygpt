@@ -21,7 +21,7 @@ class MultiHeadAttention(nn.Module):
     self.c_proj.RESIDUAL_LAYER = True
     # self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size)) # not needed for flash attention
   
-  def forward(self, x):
+  def forward(self, x, attention_mask=None):
     B, T, C = x.size() # C is n_head * head_size here
     q, k, v = self.c_attn(x).split(self.n_embd, dim=2) # q, k, v are (B, T, C)
     q = q.view(B, T, self.n_head, C // self.n_head).transpose(1,2) # (B, n_head, T, head_size = C / n_head)
@@ -31,7 +31,10 @@ class MultiHeadAttention(nn.Module):
     # att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
     # att = F.softmax(att, dim=-1) 
     # x = att @ v # (B, n_head, T, T) @ (B, n_head, T, head_size) -> (B, n_head, T, head_size)
-    x = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention (replaces the preceding 4 lines of code)
+    if attention_mask is None:
+      x = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention (replaces the preceding 4 lines of code)
+    else:
+      x = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask.view(B,1,T,T))
     x = x.transpose(1,2).contiguous().view(B, T, C) # stack head outputs
     x = self.c_proj(x)
     return x
@@ -51,13 +54,16 @@ class GroupedQueryAttention(nn.Module):
     self.c_proj = nn.Linear(self.n_embd, self.n_embd)
     self.c_proj.RESIDUAL_LAYER = True
   
-  def forward(self, x):
+  def forward(self, x, attention_mask=None):
     B, T, C = x.size() # C is n_head * head_size here
     q = self.query(x).view(B, T, self.n_head, C // self.n_head).transpose(1,2) # (B, n_head, T, head_size = C / n_head)
     k, v = self.kv_attn(x).split(self.n_embd // self.gqa_sz, dim=2) # k, v are (B, T, C)
     k = k.view(B, T, self.kv_heads, C // self.n_head).transpose(1,2)  # (B, kv_heads, T, head_size = C / n_head)
     v = v.view(B, T, self.kv_heads, C // self.n_head).transpose(1,2) 
-    x = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True) # flash attention 
+    if attention_mask is None:
+      x = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True) # flash GQA 
+    else:
+      x = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask.view(B,1,T,T), enable_gqa=True)
     x = x.transpose(1,2).contiguous().view(B, T, C) # stack head outputs
     x = self.c_proj(x)
     return x
@@ -87,8 +93,8 @@ class TransformerBlock(nn.Module):
     self.ln_2 = nn.LayerNorm(config.n_embd)
     self.mlp = MLP(config)
 
-  def forward(self, x):
-    x = x + self.attn(self.ln_1(x))
+  def forward(self, x, attention_mask=None):
+    x = x + self.attn(self.ln_1(x), attention_mask=attention_mask)
     x = x + self.mlp(self.ln_2(x))
     return x
 
@@ -119,20 +125,20 @@ class GPT(nn.Module):
     elif isinstance(module, nn.Embedding):
       torch.nn.init.normal_(module.weight, mean=0., std=std)
 
-  def forward(self, idx, targets=None):
-    B, T = idx.size()
+  def forward(self, ids, targets=None, attention_mask=None):
+    B, T = ids.size()
     if T > self.config.block_size:
-      idx = idx[:, :self.config.block_size]
+      ids = ids[:, :self.config.block_size]
       warnings.warn(
         f"The input length ({T}) exceeds the model's block size ({self.config.block_size}). The inputs have been truncated to the block size.",
         UserWarning
       )
-    pos = torch.arange(T, dtype=torch.long, device=idx.device)
+    pos = torch.arange(T, dtype=torch.long, device=ids.device)
     pos_emb = self.transformer.wpe(pos)
-    tok_emb = self.transformer.wte(idx)
+    tok_emb = self.transformer.wte(ids)
     x = pos_emb + tok_emb
     for block in self.transformer.h:
-      x = block(x)
+      x = block(x, attention_mask=attention_mask)
     x = self.transformer.ln_f(x)
     logits = self.lm_head(x)
     if targets is None:
@@ -141,38 +147,37 @@ class GPT(nn.Module):
       loss = F.cross_entropy(logits.view(B*T,-1), targets.view(B*T))
       return logits, loss
   
-  def generate(self, idx, max_new_tokens=100, temp=1., topk=False):
-    B, T = idx.size()
+  def generate(self, ids, max_new_tokens=100, temp=1., topk=50):
+    B, T = ids.size()
     for _ in range(max_new_tokens):
       if T > self.config.block_size:
-        idx = idx[:, :self.config.block_size]
+        ids = ids[:, :self.config.block_size]
         warnings.warn(
           f"The inputs have been truncated to the block size ({self.config.block_size}) because their length ({T}) exceeds the block size.",
           UserWarning
         )
-      logits = self(idx)[:,-1,:] / temp
-      if topk:
-        l, _ = torch.topk(logits, min(topk, logits.size(-1)))
-        logits[logits < l[:, [-1]]] = -float('Inf')
+      logits = self(ids)[:,-1,:] / temp
       probs = F.softmax(logits, dim=-1)
-      new_idx = torch.multinomial(probs, 1)
-      idx = torch.cat([idx, new_idx], dim=1)
-    return idx      
+      topk_probs, topk_ids = torch.topk(probs, topk, dim=-1)
+      new_ids = torch.multinomial(topk_probs, 1)
+      new_ids = torch.gather(topk_ids, -1, new_ids)
+      ids = torch.cat([ids, new_ids], dim=1)
+    return ids      
 
-  def configure_optimizer(self, weight_decay, lr, betas, device_type):
+  def configure_optimizer(self, config):
     param_dict = {pn: p for pn, p in self.named_parameters()}
     param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
     # weight decay 2D params (ie all params except biases and layernorm)
     decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
     nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
     optim_groups = [
-      {'params': decay_params, 'weight_decay': weight_decay},
+      {'params': decay_params, 'weight_decay': config.weight_decay},
       {'params': nodecay_params, 'weight_decay': 0.0}
     ]
     # use the fused AdamW if it's available
     fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-    use_fused = fused_available and device_type == 'cuda'
+    use_fused = fused_available and config.device_type == 'cuda'
     extra_args = dict(fused=True) if use_fused else dict()
-    optim = torch.optim.AdamW(optim_groups, lr=lr, betas=betas, **extra_args)
+    optim = torch.optim.AdamW(optim_groups, betas=config.betas, **extra_args)
     # print(f"using fused AdamW: {use_fused}")
     return optim
