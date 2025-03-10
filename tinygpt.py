@@ -15,6 +15,15 @@ def load_npy(filename):
   ptt = torch.tensor(npa.astype(np.int32), dtype=torch.long) # torch doesn't like int16, so convert to int32 before passing to torch
   return ptt
 
+def get_position_ids(ids):
+  eos_mask = (ids == tokenizer.eos_token_id)  # EOS token mask
+  bos_mask = torch.cat([torch.ones(1).bool(), eos_mask[:-1]]) # BOS mask (EOS mask shifted right by 1)
+  position_ids = torch.cumsum((~bos_mask).int(), dim=-1)
+  seq_mask = torch.cumsum(bos_mask.int(), dim=-1) # mask of which sequence an entry belongs to
+  tmp = torch.cat([torch.zeros(1, dtype=int), position_ids[bos_mask.bool()]])
+  position_ids = position_ids - tmp[seq_mask]
+  return position_ids
+
 class TinyStoriesDataLoader:
   
   def __init__(self, B, T, rank, world_size, split):
@@ -35,27 +44,21 @@ class TinyStoriesDataLoader:
 
   def reset(self):
     self.shard_idx = 0
-    self.toks = load_npy(self.shards[self.shard_idx])
+    self.tokens = load_npy(self.shards[self.shard_idx])
     self.pos = self.B * self.T * self.rank
 
   def get_batch(self):
     B, T = self.B, self.T
-    tmp = self.toks[self.pos : self.pos + B * T + 1]      
+    tmp = self.tokens[self.pos : self.pos + B * T + 1]
     x = tmp[:-1].view(B,T)
-    # avoid attending to tokens in other stories
-    eos_b_ids, eos_t_ids = torch.where(x == tokenizer.eos_token_id)
-    triu_mask = torch.triu(torch.ones(T,T), diagonal=1)
-    attention_mask = torch.where(triu_mask > 0, float('-inf'), 0.)
-    attention_mask = attention_mask.repeat(B,1,1)
-    for b, t in zip(eos_b_ids.tolist(), eos_t_ids.tolist()):
-      attention_mask[b,t:,:t] = float('-inf')
+    position_ids = get_position_ids(tmp[:-1]).view(B,T)
     y = tmp[1:].view(B,T)
     self.pos += B * T * self.world_size
-    if (self.pos + B * T * self.world_size + 1) > len(self.toks):
+    if (self.pos + B * T * self.world_size + 1) > len(self.tokens):
       self.shard_idx = (self.shard_idx + 1) % len(self.shards) 
-      self.toks = load_npy(self.shards[self.shard_idx])
+      self.tokens = load_npy(self.shards[self.shard_idx])
       self.pos = B * T * self.rank
-    return x, y, attention_mask
+    return x, y, position_ids
 
 ########
 # main #
@@ -119,26 +122,26 @@ class GPTConfig:
 class OptimConfig:
   device: str 
   world_size: int
-  B: int = 32 # per device batch size (32 takes up 13GB VRAM)
+  B: int = 32 # per device batch size (B, T = 32, 512 takes up 13GB VRAM)
   batch_tokens: int = 524288
   betas: tuple = (0.9, 0.95)
   max_itr: int = 9500
   max_lr: float = 1e-3
-  T: int = 512 # block size
+  T: int = 512 # block size / context length
   weight_decay: float = 1e-2
 
   def __post_init__(self):
     self.device_type = "cuda" if self.device.startswith("cuda") else "cpu"
     assert self.batch_tokens % (self.B * self.T * self.world_size) == 0
     self.grad_accum_steps = self.batch_tokens // (self.B * self.T * self.world_size)
-    self.max_decay_itrs = self.max_itr
+    self.max_decay_itr = self.max_itr
     self.min_lr = self.max_lr / 10.
     self.warmup_itr = self.max_itr // 100
   
   def cosine_decay(self, itr):
     if itr < self.warmup_itr:
       lr = self.max_lr * (itr+1) / self.warmup_itr
-    elif itr > self.max_decay_itrs:
+    elif itr > self.max_decay_itr:
       lr = self.min_lr
     else:  # cosine decay for remaining 90%
       decay_frac = (itr - self.warmup_itr) / (self.max_itr - self.warmup_itr)
@@ -148,7 +151,7 @@ class OptimConfig:
 # instantiate model
 model = GPT(GPTConfig(vocab_size=50304 ))
 model.to(device)
-model = torch.compile(model)
+# model = torch.compile(model)
 if DDP_FLAG:
   model = DDP(model, device_ids=[ddp_local_rank])
 base_model = model.module if DDP_FLAG else model
@@ -184,13 +187,13 @@ for itr in range(opt_config.max_itr):
   optimizer.zero_grad()
   cum_loss = 0.
   for min_itr in range(opt_config.grad_accum_steps):
-    x, y, attention_mask = train_loader.get_batch()
-    x, y, attention_mask = x.to(device), y.to(device), attention_mask.to(device)
+    x, y, position_ids = train_loader.get_batch()
+    x, y, position_ids = x.to(device), y.to(device), position_ids.to(device)
     if torch.cuda.is_available():
       with torch.autocast(device_type=opt_config.device_type, dtype=torch.bfloat16): 
-        logits, loss = model(x, y, attention_mask)
+        logits, loss = model(x, y, position_ids)
     else:
-      logits, loss = model(x, y, attention_mask)
+      logits, loss = model(x, y, position_ids)
     loss = loss / opt_config.grad_accum_steps
     cum_loss += loss.detach()
     if DDP_FLAG:
@@ -226,13 +229,13 @@ for itr in range(opt_config.max_itr):
     with torch.no_grad():
       cum_val_loss = 0.
       for min_itr in range(opt_config.grad_accum_steps):
-        x, y, attention_mask = val_loader.get_batch()
-        x, y, attention_mask = x.to(device), y.to(device), attention_mask.to(device)
+        x, y, position_ids = val_loader.get_batch()
+        x, y, position_ids = x.to(device), y.to(device), position_ids.to(device)
         if torch.cuda.is_available():
           with torch.autocast(device_type=opt_config.device_type, dtype=torch.bfloat16): 
-            logits, loss = model(x, y, attention_mask)
+            logits, loss = model(x, y, position_ids)
         else:
-          logits, loss = model(x, y, attention_mask)
+          logits, loss = model(x, y, position_ids)
         loss /= opt_config.grad_accum_steps
         cum_val_loss += loss.detach()
     if DDP_FLAG:
