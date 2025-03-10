@@ -6,7 +6,14 @@ import numpy as np
 import os
 import random
 import torch
+import torch.nn.functional as F
 from transformers import AutoTokenizer
+
+# set random seeds for reproducibility
+torch.manual_seed(8888)
+if torch.cuda.is_available():
+  torch.cuda.manual_seed(8888)
+  torch.set_float32_matmul_precision("high")
 
 tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neo-125M")
 
@@ -15,14 +22,14 @@ def load_npy(filename):
   ptt = torch.tensor(npa.astype(np.int32), dtype=torch.long) # torch doesn't like int16, so convert to int32 before passing to torch
   return ptt
 
-def get_position_ids(ids):
-  eos_mask = (ids == tokenizer.eos_token_id)  # EOS token mask
-  bos_mask = torch.cat([torch.ones(1).bool(), eos_mask[:-1]]) # BOS mask (EOS mask shifted right by 1)
-  position_ids = torch.cumsum((~bos_mask).int(), dim=-1)
-  seq_mask = torch.cumsum(bos_mask.int(), dim=-1) # mask of which sequence an entry belongs to
-  tmp = torch.cat([torch.zeros(1, dtype=int), position_ids[bos_mask.bool()]])
-  position_ids = position_ids - tmp[seq_mask]
-  return position_ids
+def get_pos_ids(ids, block_size):
+  bos_mask = F.pad(ids == 0, (1, 0), value=1)[:-1] # shift to the right by one
+  doc_ids = bos_mask.cumsum(dim=-1) - 1
+  pos_ids = (~bos_mask).cumsum(dim=-1)
+  pos_ids = pos_ids - pos_ids[bos_mask][doc_ids]
+  while any(pos_ids >= block_size):
+    pos_ids[pos_ids >= block_size] -= block_size
+  return pos_ids
 
 class TinyStoriesDataLoader:
   
@@ -51,20 +58,20 @@ class TinyStoriesDataLoader:
     B, T = self.B, self.T
     tmp = self.tokens[self.pos : self.pos + B * T + 1]
     x = tmp[:-1].view(B,T)
-    position_ids = get_position_ids(tmp[:-1]).view(B,T)
+    pos_ids = get_pos_ids(tmp[:-1], 512).view(B,T)
     y = tmp[1:].view(B,T)
     self.pos += B * T * self.world_size
     if (self.pos + B * T * self.world_size + 1) > len(self.tokens):
       self.shard_idx = (self.shard_idx + 1) % len(self.shards) 
       self.tokens = load_npy(self.shards[self.shard_idx])
       self.pos = B * T * self.rank
-    return x, y, position_ids
+    return x, y, pos_ids
 
 ########
 # main #
-#######################################################
-# torchrun --standalone --nproc_per_node=2 tinygpt.py #
-#######################################################
+########################################################
+# torchrun --standalone --nproc_per_node=2 tinygpt2.py #
+########################################################
 
 from dataclasses import dataclass
 import math
@@ -102,12 +109,6 @@ else:
     device = "mps"
   print(f"using {device}")
 
-# set random seeds for reproducibility
-torch.manual_seed(8888)
-if torch.cuda.is_available():
-  torch.cuda.manual_seed(8888)
-  torch.set_float32_matmul_precision("high")
-
 # model configuration
 @dataclass
 class GPTConfig:
@@ -116,7 +117,7 @@ class GPTConfig:
   n_layer: int = 12
   n_head: int = 4
   kv_heads: int = 2
-  n_embd: int = 512
+  n_embed: int = 512
 
 @dataclass
 class OptimConfig:
@@ -185,17 +186,17 @@ for itr in range(opt_config.max_itr):
     min_t0 = time.time()
   model.train()
   optimizer.zero_grad()
-  cum_loss = 0.
+  avg_loss = 0.
   for min_itr in range(opt_config.grad_accum_steps):
-    x, y, position_ids = train_loader.get_batch()
-    x, y, position_ids = x.to(device), y.to(device), position_ids.to(device)
+    x, y, pos_ids = train_loader.get_batch()
+    x, y, pos_ids = x.to(device), y.to(device), pos_ids.to(device)
     if torch.cuda.is_available():
       with torch.autocast(device_type=opt_config.device_type, dtype=torch.bfloat16): 
-        logits, loss = model(x, y, position_ids)
+        logits, loss = model(x, y, pos_ids)
     else:
-      logits, loss = model(x, y, position_ids)
+      logits, loss = model(x, y, pos_ids)
     loss = loss / opt_config.grad_accum_steps
-    cum_loss += loss.detach()
+    avg_loss += loss.detach()
     if DDP_FLAG:
       if (min_itr < opt_config.grad_accum_steps - 1):
         with model.no_sync():
@@ -205,7 +206,7 @@ for itr in range(opt_config.max_itr):
     else:
       loss.backward()
   if DDP_FLAG:
-    dist.all_reduce(cum_loss, op=dist.ReduceOp.AVG)
+    dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
   norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
   lr = opt_config.cosine_decay(itr)
   for param_group in optimizer.param_groups:
@@ -217,33 +218,33 @@ for itr in range(opt_config.max_itr):
     min_t1 = time.time()
     min_dt = min_t1 - min_t0
     TPS = ddp_world_size * opt_config.batch_tokens / min_dt 
-    print(f"iter {itr} | train loss: {cum_loss.item():.4f} | walltime: {min_dt:.2f} sec | ktoks/sec: {TPS/1e3:.2f}")
+    print(f"iter {itr} | train loss: {avg_loss.item():.4f} | walltime: {min_dt:.2f} sec | ktoks/sec: {TPS/1e3:.2f}")
     with open(train_log, "a") as f:
-      f.write(f"{itr:5d} |    {cum_loss.item():.4f} |           {min_dt:.2f} |      {TPS/1e3:.2f}\n")
+      f.write(f"{itr:5d} |    {avg_loss.item():.4f} |           {min_dt:.2f} |      {TPS/1e3:.2f}\n")
 
   # evaluate
-  FNL_ITR_FLAG = (itr == opt_config.max_itr - 1)
-  if (itr % eval_int == 0) or FNL_ITR_FLAG:
+  MAX_ITR_FLAG = (itr == opt_config.max_itr - 1)
+  if (itr % eval_int == 0) or MAX_ITR_FLAG:
     model.eval()
     val_loader.reset()
     with torch.no_grad():
-      cum_val_loss = 0.
+      avg_val_loss = 0.
       for min_itr in range(opt_config.grad_accum_steps):
-        x, y, position_ids = val_loader.get_batch()
-        x, y, position_ids = x.to(device), y.to(device), position_ids.to(device)
+        x, y, pos_ids = val_loader.get_batch()
+        x, y, pos_ids = x.to(device), y.to(device), pos_ids.to(device)
         if torch.cuda.is_available():
           with torch.autocast(device_type=opt_config.device_type, dtype=torch.bfloat16): 
-            logits, loss = model(x, y, position_ids)
+            logits, loss = model(x, y, pos_ids)
         else:
-          logits, loss = model(x, y, position_ids)
+          logits, loss = model(x, y, pos_ids)
         loss /= opt_config.grad_accum_steps
-        cum_val_loss += loss.detach()
+        avg_val_loss += loss.detach()
     if DDP_FLAG:
-      dist.all_reduce(cum_val_loss, op=dist.ReduceOp.AVG)
+      dist.all_reduce(avg_val_loss, op=dist.ReduceOp.AVG)
     if MAIN_PROC_FLAG:
       with open(val_log, "a") as f:
-        f.write(f"{itr:5d} |  {cum_val_loss.item():.4f}\n")
-      if (itr % checkpoint_int == 0) or FNL_ITR_FLAG:
+        f.write(f"{itr:5d} |  {avg_val_loss.item():.4f}\n")
+      if (itr % checkpoint_int == 0) or MAX_ITR_FLAG:
         checkpoint_path = os.path.join(log_dir, f"checkpoint_{itr:05d}.pt")
         checkpoint = {
           "iter": itr,
@@ -251,8 +252,8 @@ for itr in range(opt_config.max_itr):
           "model_state": base_model.state_dict(),
           "optimizer_config": opt_config,
           "optimizer_state": optimizer.state_dict(),
-          "train loss": cum_loss.item(),
-          "val loss": cum_val_loss.item(),
+          "train loss": avg_loss.item(),
+          "val loss": avg_val_loss.item(),
         }
         torch.save(checkpoint, checkpoint_path)
 

@@ -16,7 +16,7 @@ ts = load_dataset("roneneldan/TinyStories", split="train", cache_dir=data_dir)
 tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neo-125M")
 def tokenize(doc):
   # tokenizes a single document and returns a numpy array of uint16 tokens
-  tokens = [tokenizer.eos_token_id]  # use the tokenizer's EOT token ID
+  tokens = [tokenizer.eos_token_id]  # use the tokenizer's EOS token ID
   tokens.extend(tokenizer(doc["text"])["input_ids"])
   tokens_np = np.array(tokens)
   assert (0 <= tokens_np).all() and (tokens_np < 2**16).all(), "token dictionary too large for uint16"

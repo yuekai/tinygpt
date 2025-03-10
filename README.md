@@ -4,7 +4,7 @@ Pretrain a transfomer model on the [TinyStories dataset](https://huggingface.co/
 
 `tinystories.py` downloads the dataset, tokenizes it with Eleuther AI's GPT-Neo-125M tokenizer, and saves it in shards of 100M tokens per shard in the `tinystories` directory. There are 474M tokens in the TinyStories sdataset.
 
-`gpt.py` is a utility file that specifies the parts of the model (the actual model configuration in terms of the parts is in `tinygpt.py`). 
+`gpt.py` is a utility file that specifies a generic transformer language model (the actual model configuration is in `tinygpt.py`). 
 
 `tinygpt.py` is the main file that configures the model, implements the data loader, and trains the model. The model has 61M parameters, and we train it with batches of 500k tokens. It takes 30-ish mins to make a pass thru the dataset on a 2x 4090 node, so a 10 epoch training run takes 5-ish hrs (achieving a validation loss of 1.32).
 
@@ -35,8 +35,5 @@ The End.<|endoftext|>Once there was a little girl called Sarah. She was three ye
 ```
 
 __ToDo:__
-- [x] Implement grouped query attention (GQA) to reduce model size.
 - [x] Use attention masks to avoid attending to tokens from other documents.
-- [ ] Implement tokenizer from scratch (instead of relying on Eleuther AI's GPT-Neo-125M tokenizer).
-- [ ] Implement rotary position embeddings (instead of absolute position embeddings). This (together with GQA) brings the architecture (mostly) in line with the latest open weight LLMs.
-- [ ] Reduce the vocabulary from 50k-ish to 5k-ish. I suspect we can get away with a smaller vocabulary because the language in TinyStores is so simple. 
+- [ ] Pre-train on TinyStoriesV2

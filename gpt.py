@@ -1,7 +1,6 @@
 ###############
 # GPT-2 model #
 ###############
-
 import inspect
 import warnings
 
@@ -9,75 +8,28 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+import torch.nn.attention as attn
+# import torch.nn.attention.flex_attention as FA
+
 class MultiHeadAttention(nn.Module):
   
   def __init__(self, config):
     super().__init__()
-    assert config.n_embd % config.n_head == 0 # n_embd must be divisible by n_head
+    assert config.n_embed % config.n_head == 0 # n_embed must be divisible by n_head
     self.n_head = config.n_head
-    self.n_embd = config.n_embd
-    self.c_attn = nn.Linear(self.n_embd, 3 * self.n_embd, bias=False) # q, k, v projections all in one op
-    self.c_proj = nn.Linear(self.n_embd, self.n_embd)
+    self.n_embed = config.n_embed
+    self.c_attn = nn.Linear(self.n_embed, 3 * self.n_embed, bias=False) # q, k, v projections all in one op
+    self.c_proj = nn.Linear(self.n_embed, self.n_embed)
     self.c_proj.RESIDUAL_LAYER = True
-    # self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size)) # not needed for flash attention
-    self.register_buffer("triu_mask", torch.triu(torch.ones(config.block_size, config.block_size, dtype=torch.bool), diagonal=1))
   
-  def forward(self, x, position_ids=None):
+  def forward(self, x, attn_mask):
     B, T, C = x.size() # C is n_head * head_size here
-    q, k, v = self.c_attn(x).split(self.n_embd, dim=2) # q, k, v are (B, T, C)
-    q = q.view(B, T, self.n_head, C // self.n_head).transpose(1,2) # (B, n_head, T, head_size = C / n_head)
-    k = k.view(B, T, self.n_head, C // self.n_head).transpose(1,2) 
+    q, k, v = self.c_attn(x).split(self.n_embed, dim=2) # q, k, v are (B, T, C)
+    q = q.view(B, T, self.n_head, C // self.n_head).transpose(1,2) # (B, T, n_head, head_size = C / n_head)
+    k = k.view(B, T, self.n_head, C // self.n_head).transpose(1,2)
     v = v.view(B, T, self.n_head, C // self.n_head).transpose(1,2)
-    # att = (q @ k.transpose(-2,-1)) * (1.0 / math.sqrt(k.size(-1))) # (B, n_head, T, head_size) @ (B, n_head, head_size, T) -> (B, n_head, T, T)
-    # att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-    # att = F.softmax(att, dim=-1) 
-    # x = att @ v # (B, n_head, T, T) @ (B, n_head, T, head_size) -> (B, n_head, T, head_size)
-    if position_ids is None:
-      x = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention (replaces the preceding 4 lines of code)
-    else:
-      with torch.no_grad():
-        attention_bias = torch.zeros(B, 1, T, T, device=x.device)
-        bos_b_ids, bos_t_ids = torch.where(position_ids == 0)
-        for b, t in zip(bos_b_ids.tolist(), bos_t_ids.tolist()):
-          attention_bias[b,t:,:t] = float('-inf')
-        attention_bias.masked_fill_(self.triu_mask.view(1,1,T,T), float('-inf'))
-      x = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_bias)
-    x = x.transpose(1,2).contiguous().view(B, T, C) # stack head outputs
-    x = self.c_proj(x)
-    return x
-
-class GroupedQueryAttention(nn.Module):
-
-  def __init__(self, config):
-    super().__init__()
-    assert config.n_embd % config.n_head == 0 # n_embd must be divisible by n_head
-    assert config.n_head % config.kv_heads == 0 # n_head must be divisible by kv_heads
-    self.n_head = config.n_head
-    self.n_embd = config.n_embd
-    self.kv_heads = config.kv_heads
-    self.gqa_sz = self.n_head // self.kv_heads
-    self.query = nn.Linear(config.n_embd, config.n_embd, bias=False)
-    self.kv_attn = nn.Linear(self.n_embd, 2 * self.n_embd // self.gqa_sz, bias=False) # k, v projections all in one op
-    self.c_proj = nn.Linear(self.n_embd, self.n_embd)
-    self.c_proj.RESIDUAL_LAYER = True
-    self.register_buffer("triu_mask", torch.triu(torch.ones(config.block_size, config.block_size, dtype=torch.bool), diagonal=1))
-
-  def forward(self, x, position_ids=None):
-    B, T, C = x.size() # C is n_head * head_size here
-    q = self.query(x).view(B, T, self.n_head, C // self.n_head).transpose(1,2) # (B, n_head, T, head_size = C / n_head)
-    k, v = self.kv_attn(x).split(self.n_embd // self.gqa_sz, dim=2) # k, v are (B, T, C)
-    k = k.view(B, T, self.kv_heads, C // self.n_head).transpose(1,2)  # (B, kv_heads, T, head_size = C / n_head)
-    v = v.view(B, T, self.kv_heads, C // self.n_head).transpose(1,2) 
-    if position_ids is None:
-      x = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True) # flash GQA 
-    else:
-      with torch.no_grad():
-        attention_bias = torch.zeros(B, 1, T, T, device=x.device)
-        bos_b_ids, bos_t_ids = torch.where(position_ids == 0)
-        for b, t in zip(bos_b_ids.tolist(), bos_t_ids.tolist()):
-          attention_bias[b,t:,:t] = float('-inf')
-        attention_bias.masked_fill_(self.triu_mask.view(1,1,T,T), float('-inf'))
-      x = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_bias, enable_gqa=True)
+    x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+    # x = FA.flex_attention(q.transpose(1,2), k.transpose(1,2), v.transpose(1,2), block_mask=attn_mask)
     x = x.transpose(1,2).contiguous().view(B, T, C) # stack head outputs
     x = self.c_proj(x)
     return x
@@ -86,9 +38,9 @@ class MLP(nn.Module):
   
   def __init__(self, config):
     super().__init__()
-    self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
+    self.c_fc = nn.Linear(config.n_embed, 4 * config.n_embed)
     self.gelu = nn.GELU()
-    self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+    self.c_proj = nn.Linear(4 * config.n_embed, config.n_embed)
     self.c_proj.RESIDUAL_LAYER = True
 
   def forward(self, x):
@@ -101,14 +53,13 @@ class TransformerBlock(nn.Module):
 
   def __init__(self, config):
     super().__init__()
-    self.ln_1 = nn.LayerNorm(config.n_embd)
-    # self.attn = MultiHeadAttention(config)
-    self.attn = GroupedQueryAttention(config) # use GQA for smaller models
-    self.ln_2 = nn.LayerNorm(config.n_embd)
+    self.ln_1 = nn.LayerNorm(config.n_embed)
+    self.attn = MultiHeadAttention(config)
+    self.ln_2 = nn.LayerNorm(config.n_embed)
     self.mlp = MLP(config)
 
-  def forward(self, x, position_ids=None):
-    x = x + self.attn(self.ln_1(x), position_ids=position_ids)
+  def forward(self, x, attn_mask):
+    x = x + self.attn(self.ln_1(x), attn_mask)
     x = x + self.mlp(self.ln_2(x))
     return x
 
@@ -118,18 +69,18 @@ class GPT(nn.Module):
     super().__init__()
     self.config = config
     self.transformer = nn.ModuleDict(dict(
-      wte = nn.Embedding(config.vocab_size, config.n_embd),
-      wpe = nn.Embedding(config.block_size, config.n_embd),
+      wte = nn.Embedding(config.vocab_size, config.n_embed),
+      wpe = nn.Embedding(config.block_size, config.n_embed),
       h = nn.ModuleList([TransformerBlock(config) for _ in range(config.n_layer)]),
-      ln_f = nn.LayerNorm(config.n_embd)
+      ln_f = nn.LayerNorm(config.n_embed)
     ))
-    self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+    self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias=False)
     self.transformer.wte.weight = self.lm_head.weight # share wte and lm_head weights
 
     self.apply(self._init_weights)
   
   def _init_weights(self, module):
-    std = self.config.n_embd ** -0.5
+    std = self.config.n_embed ** -0.5
     if isinstance(module, nn.Linear):
       if hasattr(module, 'RESIDUAL_LAYER'):
         std *= (2 * self.config.n_layer) ** -0.5
@@ -139,20 +90,24 @@ class GPT(nn.Module):
     elif isinstance(module, nn.Embedding):
       torch.nn.init.normal_(module.weight, mean=0., std=std)
 
-  def forward(self, ids, targets=None, position_ids=None):
+  def forward(self, ids, targets=None, pos_ids=None):
     B, T = ids.size()
-    if T > self.config.block_size:
-      ids = ids[:, :self.config.block_size]
-      warnings.warn(
-        f"The input length ({T}) exceeds the model's block size ({self.config.block_size}). The inputs have been truncated to the block size.",
-        UserWarning
-      )
-    pos = torch.arange(T, dtype=torch.long, device=ids.device)
-    pos_emb = self.transformer.wpe(pos)
+    attn_mask = torch.ones(T, T, dtype=torch.bool, device=ids.device).tril()
+    if pos_ids is None:
+      pos_ids = torch.arange(T, device=ids.device)
+    else:
+      bos_mask = (pos_ids == 0)
+      doc_ids = bos_mask.cumsum(dim=-1)
+      doc_ids = F.pad(doc_ids, (1,0))[...,:-1].view(B,T)
+      doc_mask = doc_ids.view(B,T,1) == doc_ids.view(B,1,T)
+      attn_mask = attn_mask.expand(B,T,T) & doc_mask
+      # attn_mask_mod = lambda b, h, q, k : (q >= k) & doc_ids[q] == doc_ids[k]
+      # attn_mask = FA.create_block_mask(attn_mask_mod, B, self.config.n_head, self.config.n_embed, self.config.n_embed, device=ids.device, BLOCK_SIZE=512)
+    pos_emb = self.transformer.wpe(pos_ids)
     tok_emb = self.transformer.wte(ids)
     x = pos_emb + tok_emb
     for block in self.transformer.h:
-      x = block(x, position_ids=position_ids)
+      x = block(x, attn_mask.view(B,1,T,T))
     x = self.transformer.ln_f(x)
     logits = self.lm_head(x)
     if targets is None:
