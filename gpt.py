@@ -96,10 +96,10 @@ class GPT(nn.Module):
     if pos_ids is None:
       pos_ids = torch.arange(T, device=ids.device)
     else:
-      bos_mask = (pos_ids == 0)
-      doc_ids = bos_mask.cumsum(dim=-1)
-      doc_ids = F.pad(doc_ids, (1,0))[...,:-1].view(B,T)
-      doc_mask = doc_ids.view(B,T,1) == doc_ids.view(B,1,T)
+      bos_mask  = (pos_ids == 0)
+      doc_ids   = bos_mask.cumsum(dim=-1)
+      doc_ids   = F.pad(doc_ids, (1,0))[...,:-1].view(B,T)
+      doc_mask  = doc_ids.view(B,T,1) == doc_ids.view(B,1,T)
       attn_mask = attn_mask.expand(B,T,T) & doc_mask
       # attn_mask_mod = lambda b, h, q, k : (q >= k) & doc_ids[q] == doc_ids[k]
       # attn_mask = FA.create_block_mask(attn_mask_mod, B, self.config.n_head, self.config.n_embed, self.config.n_embed, device=ids.device, BLOCK_SIZE=512)

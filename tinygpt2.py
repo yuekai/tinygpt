@@ -45,7 +45,7 @@ class TinyStoriesDataLoader:
     shards = [os.path.join(data_dir,s) for s in shards if split in s]
     random.shuffle(shards)
     self.shards = shards
-    if MAIN_PROC_FLAG:
+    if IS_MAIN_PROC:
       print(f"loading {len(shards)} shards in {split} split")
     self.reset()
 
@@ -85,8 +85,8 @@ import torch.distributed as dist
 from gpt import GPT
 
 # set up training environment
-DDP_FLAG = (int(os.environ.get('RANK',-1)) != -1)
-if DDP_FLAG:
+USE_DDP = (int(os.environ.get('RANK',-1)) != -1)
+if USE_DDP:
   assert torch.cuda.is_available()
   init_process_group(backend='nccl')
   ddp_rank = int(os.environ['RANK'])
@@ -94,13 +94,13 @@ if DDP_FLAG:
   ddp_world_size = int(os.environ['WORLD_SIZE'])
   device = f"cuda:{ddp_local_rank}"
   torch.cuda.set_device(device)
-  MAIN_PROC_FLAG = (ddp_rank == 0)
+  IS_MAIN_PROC = (ddp_rank == 0)
   print(f"setting up GPU {ddp_rank+1} of {ddp_world_size}")
 else:
   ddp_rank = 0
   ddp_local_rank = ddp_rank
   ddp_world_size = 1
-  MAIN_PROC_FLAG = True
+  IS_MAIN_PROC = True
   # autodetect GPU
   device = "cpu"
   if torch.cuda.is_available():
@@ -116,7 +116,6 @@ class GPTConfig:
   vocab_size: int = 50257
   n_layer: int = 12
   n_head: int = 4
-  kv_heads: int = 2
   n_embed: int = 512
 
 @dataclass
@@ -153,9 +152,9 @@ class OptimConfig:
 model = GPT(GPTConfig(vocab_size=50304 ))
 model.to(device)
 # model = torch.compile(model)
-if DDP_FLAG:
+if USE_DDP:
   model = DDP(model, device_ids=[ddp_local_rank])
-base_model = model.module if DDP_FLAG else model
+base_model = model.module if USE_DDP else model
 
 # instantiate optimizer
 opt_config = OptimConfig(device=device, world_size=ddp_world_size)
@@ -166,7 +165,7 @@ train_loader = TinyStoriesDataLoader(B=opt_config.B, T=opt_config.T, rank=ddp_ra
 val_loader = TinyStoriesDataLoader(B=opt_config.B, T=opt_config.T, rank=ddp_rank, world_size=ddp_world_size, split="val")
 
 # set up logging
-if MAIN_PROC_FLAG:
+if IS_MAIN_PROC:
   log_dir = "log"
   os.makedirs(log_dir, exist_ok=True)
   train_log = os.path.join(log_dir, f"train_log.txt")
@@ -182,7 +181,7 @@ eval_int = print_int
 for itr in range(opt_config.max_itr):
 
   # train
-  if MAIN_PROC_FLAG:
+  if IS_MAIN_PROC:
     min_t0 = time.time()
   model.train()
   optimizer.zero_grad()
@@ -197,7 +196,7 @@ for itr in range(opt_config.max_itr):
       logits, loss = model(x, y, pos_ids)
     loss = loss / opt_config.grad_accum_steps
     avg_loss += loss.detach()
-    if DDP_FLAG:
+    if USE_DDP:
       if (min_itr < opt_config.grad_accum_steps - 1):
         with model.no_sync():
           loss.backward()
@@ -205,7 +204,7 @@ for itr in range(opt_config.max_itr):
         loss.backward()
     else:
       loss.backward()
-  if DDP_FLAG:
+  if USE_DDP:
     dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
   norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
   lr = opt_config.cosine_decay(itr)
@@ -214,7 +213,7 @@ for itr in range(opt_config.max_itr):
   optimizer.step()
   if torch.cuda.is_available():
     torch.cuda.synchronize()
-  if (itr % print_int == 0) and MAIN_PROC_FLAG:
+  if (itr % print_int == 0) and IS_MAIN_PROC:
     min_t1 = time.time()
     min_dt = min_t1 - min_t0
     TPS = ddp_world_size * opt_config.batch_tokens / min_dt 
@@ -223,8 +222,8 @@ for itr in range(opt_config.max_itr):
       f.write(f"{itr:5d} |    {avg_loss.item():.4f} |           {min_dt:.2f} |      {TPS/1e3:.2f}\n")
 
   # evaluate
-  MAX_ITR_FLAG = (itr == opt_config.max_itr - 1)
-  if (itr % eval_int == 0) or MAX_ITR_FLAG:
+  IS_MAX_ITR = (itr == opt_config.max_itr - 1)
+  if (itr % eval_int == 0) or IS_MAX_ITR:
     model.eval()
     val_loader.reset()
     with torch.no_grad():
@@ -239,12 +238,12 @@ for itr in range(opt_config.max_itr):
           logits, loss = model(x, y, pos_ids)
         loss /= opt_config.grad_accum_steps
         avg_val_loss += loss.detach()
-    if DDP_FLAG:
+    if USE_DDP:
       dist.all_reduce(avg_val_loss, op=dist.ReduceOp.AVG)
-    if MAIN_PROC_FLAG:
+    if IS_MAIN_PROC:
       with open(val_log, "a") as f:
         f.write(f"{itr:5d} |  {avg_val_loss.item():.4f}\n")
-      if (itr % checkpoint_int == 0) or MAX_ITR_FLAG:
+      if (itr % checkpoint_int == 0) or IS_MAX_ITR:
         checkpoint_path = os.path.join(log_dir, f"checkpoint_{itr:05d}.pt")
         checkpoint = {
           "iter": itr,
@@ -257,5 +256,5 @@ for itr in range(opt_config.max_itr):
         }
         torch.save(checkpoint, checkpoint_path)
 
-if DDP_FLAG:
+if USE_DDP:
   destroy_process_group()
